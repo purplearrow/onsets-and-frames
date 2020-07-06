@@ -11,6 +11,7 @@ from tqdm import tqdm
 from .constants import *
 from .midi import parse_midi
 
+import librosa
 
 class PianoRollAudioDataset(Dataset):
     def __init__(self, path, groups=None, sequence_length=None, seed=42, device=DEFAULT_DEVICE):
@@ -25,7 +26,33 @@ class PianoRollAudioDataset(Dataset):
               f"of {self.__class__.__name__} at {path}")
         for group in groups:
             for input_files in tqdm(self.files(group), desc='Loading group %s' % group):
-                self.data.append(self.load(*input_files))
+                #purplearrow modified
+                if self.sequence_length is None:  #use this flag to tell train/test. if None, it is test
+                    #enable the following for testing
+                    self.data.append(self.load(*input_files))
+                else:
+                    #for debug purpose, not to load all to save time
+                    #if (len(self.data)>=64):
+                    #    print ('load 8 data. early return for debug purpose')
+                    #    continue
+
+                    #enable the following for training
+                    load_result = self.load(*input_files)
+                    if (load_result.__contains__("shift_audios")):
+                        #because of CPU memory, just leave one here
+                        idx = self.random.randint(len(load_result["shift_audios"]))
+                        load_result["shift_audios"] = [load_result["shift_audios"][idx]]
+                        load_result["shifts"] = [load_result["shifts"][idx]]
+                        self.data.append(load_result)
+
+    #purplearrow add
+    def purplearrow_process(self, groups, id):
+        for group in groups:
+            i=0
+            for input_files in tqdm(self.files(group), desc='Loading group %s' % group):
+                if i % 8 == id:
+                    self.load(*input_files)
+                i += 1
 
     def __getitem__(self, index):
         data = self.data[index]
@@ -42,7 +69,16 @@ class PianoRollAudioDataset(Dataset):
 
             result['audio'] = data['audio'][begin:end].to(self.device)
             result['label'] = data['label'][step_begin:step_end, :].to(self.device)
-            result['velocity'] = data['velocity'][step_begin:step_end, :].to(self.device)
+            result['velocity'] = data['velocity'][step_begin:step_end, :].to(self.device).float()
+
+            #purplearrow add
+            select_shift_idx = 0
+            if len(data['shifts'])>1:
+                select_shift_idx = self.random.randint(len(data['shifts']))
+            result['shift_audio'] = data['shift_audios'][select_shift_idx][begin:end].to(self.device)
+            duplicated_shift = torch.tensor(data['shifts'][select_shift_idx], dtype=torch.int8)
+            duplicated_shift = duplicated_shift.expand(result['label'].shape[0])
+            result['shift'] = duplicated_shift.to(self.device).float()
         else:
             result['audio'] = data['audio'].to(self.device)
             result['label'] = data['label'].to(self.device)
@@ -53,6 +89,10 @@ class PianoRollAudioDataset(Dataset):
         result['offset'] = (result['label'] == 1).float()
         result['frame'] = (result['label'] > 1).float()
         result['velocity'] = result['velocity'].float().div_(128.0)
+        
+        #purplearrow add, tmp remove due to evaluate
+        if 'shift_audio' in result:
+            result['shift_audio'] = result['shift_audio'].float().div_(32768.0)
 
         return result
 
@@ -94,6 +134,7 @@ class PianoRollAudioDataset(Dataset):
         saved_data_path = audio_path.replace('.flac', '.pt').replace('.wav', '.pt')
         if os.path.exists(saved_data_path):
             return torch.load(saved_data_path)
+        #print ("purplearrow force reload")
 
         audio, sr = soundfile.read(audio_path, dtype='int16')
         assert sr == SAMPLE_RATE
@@ -123,9 +164,26 @@ class PianoRollAudioDataset(Dataset):
             label[frame_right:offset_right, f] = 1
             velocity[left:frame_right, f] = vel
 
-        data = dict(path=audio_path, audio=audio, label=label, velocity=velocity)
+        shift_audios, shifts = self.gen_shift_audio(audio, sr)
+
+        data = dict(path=audio_path, audio=audio, label=label, velocity=velocity, shift_audios=shift_audios, shifts=shifts)
         torch.save(data, saved_data_path)
         return data
+    
+    def gen_shift_audio(self, audio, sr):
+        ''' assume input audio.dtype = int16, shift keys (-4,-3,...,3,4) and return keys '''
+        faudio = np.float32(audio)
+        shift_audios = []
+        shifts = []
+        for i in range(-4, 5):
+            if i == 0: continue
+            result = librosa.effects.pitch_shift(faudio, sr, n_steps=i)
+            result = np.int16(result)
+            result = torch.ShortTensor(result)
+            shift_audios.append(result)
+            shifts.append(i)
+        return shift_audios, shifts
+
 
 
 class MAESTRO(PianoRollAudioDataset):
